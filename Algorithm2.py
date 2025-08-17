@@ -422,6 +422,19 @@ def main():
     # ======================================================
     # 1. 评估您的主算法 (Algo 2: Shuffle + PL)
     # ======================================================
+    print("\n\n=== 评估主算法 (Algo 2: Shuffle + PL) ===")
+    out_df, map_df, lonlat_meta = algo2_global_shuffle_and_pl(
+        df, epsilon=args.epsilon, seed=args.seed, keep_bbox=(not args.no_bbox)
+    )
+
+    # 评估指标
+    metrics = compute_metrics(out_df, epsilon=args.epsilon, window=args.window)
+    print("--- 基础指标 ---")
+    for k, v in metrics.items():
+        print(f"{k}: {v}")
+
+    # --- LP 评估 ---
+    # 准备真实坐标和发布坐标（米制）
     # --- LP 评估 ---
     # 直接使用算法函数返回的、更可靠的米制坐标
     df_true_xy = out_df[["orig_x_m", "orig_y_m"]].rename(columns={"orig_x_m": "x_m", "orig_y_m": "y_m"})
@@ -457,7 +470,6 @@ def main():
         print(f"{k}: {v}")
 
     # --- LP 评估 (使用相同的 prior) ---
-    # 准备发布坐标（米制），真实坐标不变
     # --- LP 评估 (使用相同的 prior) ---
     # 直接使用算法函数返回的、更可靠的米制坐标
     baseline_true_xy = baseline_out_df[["orig_x_m", "orig_y_m"]].rename(columns={"orig_x_m": "x_m", "orig_y_m": "y_m"})
@@ -471,9 +483,6 @@ def main():
     print("--- 攻击者指标 ---")
     print(f"LP_mean_m: {baseline_lp_mean_m:.3f}")
     print(f"LP_median_m: {baseline_lp_median_m:.3f}")
-
-    # (可选) 导出结果...
-    # ...
 
     # # 导出
     # out_path = args.out_csv or os.path.join(args.data_dir, "algo2_output.csv")
