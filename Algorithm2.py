@@ -1,549 +1,491 @@
+# Filename: Algorithm.py
 # -*- coding: utf-8 -*-
-"""
-Algorithm2.py — 轨迹置换匿名（窗口级候选 + 匈牙利/贪心 + 最大置换距离）
 
-用法:
-  python Algorithm2.py --data_dir tdrive_data --out algo2_fast_output.csv
-  # 只读前 N 个文件 / 前 M 行:
-  python Algorithm2.py --data_dir tdrive_data --limit_files 10 --limit_rows 50000
-
-依赖: numpy, pandas
-可选: scikit-learn (KDTree), scipy (linear_sum_assignment)
-"""
-
-import os, re, glob, math, argparse
-from collections import Counter
+import os, glob, argparse, math
 import numpy as np
 import pandas as pd
 
 # -------------------------------
-# 可选依赖
+# 经纬度 <-> 米制（局部等距近似）
 # -------------------------------
-try:
-    from sklearn.neighbors import KDTree
-    SK_KDTREE = True
-except Exception:
-    KDTree = None
-    SK_KDTREE = False
+def lonlat_to_m(lon_deg: np.ndarray, lat_deg: np.ndarray):
+    lat0 = float(np.median(lat_deg))
+    kx = 111_320.0 * math.cos(math.radians(lat0))  # m/deg (lon)
+    ky = 110_574.0                                 # m/deg (lat)
+    return lon_deg * kx, lat_deg * ky, {"lat0": lat0, "kx": kx, "ky": ky}
 
-try:
-    from scipy.optimize import linear_sum_assignment
-    SCIPY_OK = True
-except Exception:
-    linear_sum_assignment = None
-    SCIPY_OK = False
-
+def m_to_lonlat(x_m: np.ndarray, y_m: np.ndarray, meta: dict):
+    return x_m / meta["kx"], y_m / meta["ky"]
 
 # -------------------------------
-# 算法参数（建议从这组开始，再逐步收紧）
-# -------------------------------
-RANDOM_SEED = 2025
+# 读数据：tdrive_data/*.txt|*.csv
+# 期望列：user_id / timestamp / lon / lat（或无表头四列）
+# ------------------------------
+TS_FMT = "%Y-%m-%d %H:%M:%S"
+_ID_ALIASES  = {"user_id","uid","anon_id","id","taxi_id","vehicle_id","driver_id"}
+_TS_ALIASES  = {"timestamp","time","datetime","date_time","dateTime"}
+_LON_ALIASES = {"lon","lng","longitude","x"}
+_LAT_ALIASES = {"lat","latitude","y"}
 
-# 小实验：限制读取数量（None 表示不限制）
-LIMIT_FILES = 10
-LIMIT_ROWS  = 100000
+def _has_header(first_line: str) -> bool:
+    toks = [t.strip().lower() for t in first_line.strip().split(",")]
+    return any(t in (_ID_ALIASES|_TS_ALIASES|_LON_ALIASES|_LAT_ALIASES) for t in toks)
 
-# 时间窗口（分钟）
-TIME_WINDOW_MIN = 45
-
-# 候选空间半径（米）
-RS = 2500.0     # 起点半径
-RE = 5000.0     # 终点半径（无就设 None 或 0）
-
-# 运动学阈值
-DV      = 25.0      # 速度差阈值 (km/h)
-DTHETA  = 90.0     # 朝向差阈值 (deg)
-LEN_TOL = 1000.0    # 轨迹段长度差阈值 (m)
-
-# 代价函数权重（空间已做半径归一化）
-W_S = 1.00   # 起点距离/RS
-W_E = 0.70   # 终点距离/RE
-W_V = 0.10   # |Δv|/DV
-W_T = 0.05   # angdiff/ DTHETA
-W_L = 0.0005 # |Δlen|/LEN_TOL
-
-# 匹配规模阈值（<= 用匈牙利，否则贪心）
-MAX_HUNGARIAN_N = 60
-
-# BRP 先验网格（米）
-CELL_SIZE_M  = 50.0         # 备用
-PRIOR_GRID_M = 2000.0       # 稳定性更好（1500~3000 均可）
-
-# 自身匹配代价（禁止对角时用）
-IDENTITY_PENALTY = 1e12
-
-# ★ 最大置换距离（米）：起点&终点都须 ≤ 此阈值才允许置换；否则自匹配
-MAX_SWAP_DIST_M = 3000.0
+def _rename_cols(cols):
+    out=[]
+    for c in cols:
+        cl=str(c).strip().lower()
+        if   cl in _ID_ALIASES:  out.append("user_id")
+        elif cl in _TS_ALIASES:  out.append("timestamp")
+        elif cl in _LON_ALIASES: out.append("lon")
+        elif cl in _LAT_ALIASES: out.append("lat")
+        else: out.append(cl)
+    return out
 
 
-# -------------------------------
-# 工具函数
-# -------------------------------
-# -------------------------------
-# 工具函数（替换这两个）
-# -------------------------------
-def is_lonlat_like(a):
+def _parse_ts_fast(col: pd.Series) -> pd.Series:
+    s = col.astype("string").str.strip()
+    # 关键修改：直接初始化为带时区的dtype，以匹配后续所有解析操作
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns, UTC]")
+
+    p1 = pd.to_datetime(s, format=TS_FMT, errors="coerce", utc=True)
+    out.loc[:] = p1
+    left = out.isna()
+    if left.any():
+        s_left = s[left]
+        mask_num = s_left.str.fullmatch(r"\d+").fillna(False)
+        if mask_num.any():
+            num = pd.to_numeric(s_left[mask_num], errors="coerce")
+            unit = "ms" if num.median(skipna=True) and num.median() > 1e12 else "s"
+            out.loc[s_left.index[mask_num]] = pd.to_datetime(num, unit=unit, errors="coerce", utc=True)
+    left = out.isna()
+    if left.any():
+        out.loc[left] = pd.to_datetime(s[left], errors="coerce", utc=True)
+
+    return out.dt.tz_localize(None)
+
+def load_tdrive_folder(folder: str) -> pd.DataFrame:
+    files = sorted(glob.glob(os.path.join(folder,"*.txt")) +
+                   glob.glob(os.path.join(folder,"*.csv")))
+    if not files:
+        raise FileNotFoundError(f"No txt/csv found in: {folder}")
+
+    dfs=[]
+    for f in files:
+        df = pd.read_csv(
+            f, sep=",", header=None, engine="c",
+            names=["user_id", "timestamp", "lon", "lat"],
+            usecols=[0, 1, 2, 3],
+            encoding="utf-8-sig"
+        )
+        # -------------------- 修改结束 --------------------
+
+        # 只保留核心四列（若文件有多余列会被丢弃）
+        keep = [c for c in ["user_id", "timestamp", "lon", "lat"] if c in df.columns]
+        df = df[keep]
+
+        # user_id 读完再转数值，避免 "anon_id" 触发异常
+        df["user_id"] = pd.to_numeric(df["user_id"], errors="coerce").astype("Int64")
+
+        # 时间戳快速解析（固定格式 -> epoch -> 兜底）
+        df["timestamp"] = _parse_ts_fast(df["timestamp"])
+
+        # 类型清洗
+        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+
+        df = df.dropna(subset=["user_id","timestamp","lon","lat"])
+        df["user_id"] = df["user_id"].astype(np.int64)
+        dfs.append(df)
+
+    out = pd.concat(dfs, ignore_index=True)
+    out = out.drop_duplicates(subset=["user_id","timestamp","lon","lat"])
+    out = out.sort_values(["user_id","timestamp"]).reset_index(drop=True)
+    return out
+
+def build_prior_grid(x_m, y_m, cell_m=200.0, smooth=1.0):
     """
-    既支持 pandas Series 也支持 numpy ndarray。
-    判断数值是否像经纬度范围：[-180, 180]。
+    基于原始坐标(米)构建空间先验：把点落到 cell_m 网格，计数后做+smooth 平滑。
+    返回 prior 网格以及坐标映射参数。
     """
-    a = np.asarray(a, dtype=float)           # 统一成 ndarray
-    if a.size == 0:
-        return False
-    mask = ~np.isnan(a)
-    if not np.any(mask):                     # 全是 NaN
-        return False
-    mn = float(np.nanmin(a))
-    mx = float(np.nanmax(a))
-    return (mn >= -180.0 - 1e-6) and (mx <= 180.0 + 1e-6)
+    x_m = np.asarray(x_m, dtype=float)
+    y_m = np.asarray(y_m, dtype=float)
+    xmin, xmax = float(x_m.min()), float(x_m.max())
+    ymin, ymax = float(y_m.min()), float(y_m.max())
+    nx = int(np.ceil((xmax - xmin) / cell_m)) + 1
+    ny = int(np.ceil((ymax - ymin) / cell_m)) + 1
+    counts = np.zeros((ny, nx), dtype=np.float64)
 
-def to_xy_meters(df, xcol, ycol):
-    """
-    如果像经纬度，则做近似墨卡托到米的投影；否则按原始数值使用。
-    """
-    x_series = pd.to_numeric(df[xcol], errors='coerce')
-    y_series = pd.to_numeric(df[ycol], errors='coerce')
-    x = x_series.to_numpy(dtype=float)
-    y = y_series.to_numpy(dtype=float)
+    ix = np.clip(((x_m - xmin) / cell_m).astype(int), 0, nx - 1)
+    iy = np.clip(((y_m - ymin) / cell_m).astype(int), 0, ny - 1)
+    np.add.at(counts, (iy, ix), 1.0)
 
-    if is_lonlat_like(x) and is_lonlat_like(y):
-        lon, lat = x, y
-        lat0 = np.nanmean(lat) if not np.isnan(lat).all() else 0.0
-        R = 6371000.0
-        x_m = np.deg2rad(lon - np.nanmean(lon)) * R * math.cos(math.radians(lat0))
-        y_m = np.deg2rad(lat - np.nanmean(lat)) * R
-        return x_m, y_m
+    prior = (counts + smooth)
+    prior /= prior.sum()  # 归一化成概率
+
+    meta = {"xmin": xmin, "ymin": ymin, "cell": cell_m, "ny": ny, "nx": nx}
+    return prior, meta
+
+def _cell_center(ix, iy, meta):
+    cx = meta["xmin"] + (ix + 0.5) * meta["cell"]
+    cy = meta["ymin"] + (iy + 0.5) * meta["cell"]
+    return cx, cy
+
+def bayes_est_point(zx, zy, eps, prior, meta, radius_m):
+    """
+    给定发布点 z=(zx,zy)、先验 prior、epsilon 和搜索半径，返回攻击者的 MAP 估计 (x_hat,y_hat)。
+    似然按 planar Laplace：L ∝ exp(-eps * d)，常数因子对 argmax 不重要。
+    """
+    cell = meta["cell"]
+    ny, nx = prior.shape
+    rx = int(np.ceil(radius_m / cell))
+    ix0 = int(np.round((zx - meta["xmin"]) / cell))
+    iy0 = int(np.round((zy - meta["ymin"]) / cell))
+
+    ix_lo = max(0, ix0 - rx); ix_hi = min(nx - 1, ix0 + rx)
+    iy_lo = max(0, iy0 - rx); iy_hi = min(ny - 1, iy0 + rx)
+
+    best_s, best_xy = -1.0, (zx, zy)
+    # 穷举邻域网格（半径通常取 3~5 倍理论噪声）
+    for iy in range(iy_lo, iy_hi + 1):
+        cy = meta["ymin"] + (iy + 0.5) * cell
+        for ix in range(ix_lo, ix_hi + 1):
+            cx = meta["xmin"] + (ix + 0.5) * cell
+            d = float(np.hypot(zx - cx, zy - cy))
+            s = prior[iy, ix] * np.exp(-eps * d)
+            if s > best_s:
+                best_s = s
+                best_xy = (cx, cy)
+    return best_xy
+
+def compute_LP_mean_median(df_true_xy_m, df_pub_xy_m, eps, prior, meta,
+                           radius_m, rid_col=None):
+    """
+    计算 LP：对每个发布点做贝叶斯重映射并与其真实点求距离。
+    - df_true_xy_m: 必须含 x_m, y_m（原始）
+    - df_pub_xy_m : 必须含 x_m, y_m（发布/扰动后）
+    - 若二者有行号/主键（如 'rid'），可传 rid_col=该列名进行对齐；否则按索引一一对应
+    返回: lp_mean, lp_median
+    """
+    if rid_col and (rid_col in df_true_xy_m.columns) and (rid_col in df_pub_xy_m.columns):
+        true = df_true_xy_m[[rid_col, "x_m", "y_m"]].set_index(rid_col)
+        pub  = df_pub_xy_m[[rid_col, "x_m", "y_m"]].set_index(rid_col).loc[true.index]
+        x_t, y_t = true["x_m"].to_numpy(), true["y_m"].to_numpy()
+        x_z, y_z = pub["x_m"].to_numpy(),  pub["y_m"].to_numpy()
     else:
-        return x, y
+        # 按当前顺序对齐
+        x_t = df_true_xy_m["x_m"].to_numpy()
+        y_t = df_true_xy_m["y_m"].to_numpy()
+        x_z = df_pub_xy_m["x_m"].to_numpy()
+        y_z = df_pub_xy_m["y_m"].to_numpy()
+        n = min(len(x_t), len(x_z))
+        x_t, y_t, x_z, y_z = x_t[:n], y_t[:n], x_z[:n], y_z[:n]
 
+    dists = np.empty_like(x_t, dtype=np.float64)
+    for i in range(len(x_t)):
+        xh, yh = bayes_est_point(x_z[i], y_z[i], eps, prior, meta, radius_m)
+        dists[i] = float(np.hypot(x_t[i] - xh, y_t[i] - yh))
 
-def robust_parse_time(s):
-    try:
-        v = float(s)
-        if v > 1e12: v /= 1000.0
-        if v > 1e10: v /= 1000.0
-        return pd.to_datetime(int(v), unit='s', utc=False)
-    except Exception:
-        return pd.to_datetime(s, utc=False, errors='coerce')
-
-def load_folder_tdrive(data_dir, limit_files=None, limit_rows=None):
-    paths = sorted([p for p in glob.glob(os.path.join(data_dir, "*")) if os.path.isfile(p)])
-    if limit_files is not None:
-        paths = paths[:int(limit_files)]
-
-    rows, total = [], 0
-    for p in paths:
-        uid_from_name = re.findall(r"(\d+)", os.path.basename(p))
-        uid_from_name = int(uid_from_name[0]) if uid_from_name else None
-        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if limit_rows is not None and total >= int(limit_rows): break
-                line = line.strip()
-                if not line: continue
-                parts = [c.strip() for c in (line.split(",") if "," in line else line.split())]
-                parts = [c for c in parts if c != ""]
-                if len(parts) < 3: continue
-
-                if len(parts) >= 4:
-                    try:
-                        uid = int(float(parts[0]))
-                        ts  = robust_parse_time(parts[1])
-                        xraw, yraw = parts[2], parts[3]
-                    except Exception:
-                        uid = uid_from_name if uid_from_name is not None else -1
-                        ts  = robust_parse_time(parts[0])
-                        xraw, yraw = parts[1], parts[2]
-                else:
-                    uid = uid_from_name if uid_from_name is not None else -1
-                    ts  = robust_parse_time(parts[0])
-                    xraw, yraw = parts[1], parts[2]
-
-                if pd.isna(ts): continue
-                rows.append((uid, ts, xraw, yraw)); total += 1
-
-    if not rows:
-        raise RuntimeError(f"在 {data_dir} 没读到有效数据")
-
-    df = pd.DataFrame(rows, columns=["user_id","t","xraw","yraw"])
-    x_m, y_m = to_xy_meters(df, "xraw", "yraw")
-    df["x"], df["y"] = x_m, y_m
-    df = df.drop(columns=["xraw","yraw"]).sort_values(["user_id","t"]).reset_index(drop=True)
-    return df
-
-def print_diagnostics(df):
-    n = len(df)
-    n_users = df["user_id"].nunique()
-    u_counts = df["user_id"].value_counts().to_dict()
-    tmin, tmax = df["t"].min(), df["t"].max()
-    hrs = (tmax - tmin).total_seconds() / 3600.0
-    print("=== 数据诊断 ===")
-    print(f"总行数: {n}")
-    print(f"用户数: {n_users}")
-    print(f"用户分布: {u_counts}")
-    print(f"时间范围: {tmin} 到 {tmax}")
-    print(f"时间跨度: {hrs:.1f} 小时")
-
-def window_iter(df_xy, win_minutes=60):
-    df = df_xy.copy()
-    w = (df["t"].view("int64") // 10**9) // int(win_minutes*60)
-    df["w"] = w.astype(np.int64)
-    for (win, uid), g in df.groupby(["w", "user_id"], sort=True):
-        yield int(win), int(uid), g.sort_values("t")
-
-def segment_stats(xy, tt):
-    if len(xy) < 2: return 0.0, 0.0, 0.0
-    diffs = xy[1:] - xy[:-1]
-    seglen = np.sqrt((diffs**2).sum(axis=1))
-    length = float(seglen.sum())
-    dt = float(tt[-1] - tt[0])
-    vbar = 0.0 if dt <= 0 else (length / dt) * 3.6  # m/s -> km/h
-    dx, dy = (xy[-1] - xy[0]).tolist()
-    thetabar = math.degrees(math.atan2(dy, dx)) % 360.0
-    return vbar, thetabar, length
-
-def angdiff(a, b):
-    return abs((a - b + 180) % 360 - 180)
-
-def angdiff_vec(a, b):
-    return np.abs((a - b + 180.0) % 360.0 - 180.0)
-
-def resample_to_len(xy_src, target_len):
-    xy_src = np.asarray(xy_src, dtype=float)
-    n = int(xy_src.shape[0]) if xy_src.ndim == 2 else 0
-    target_len = int(target_len)
-    if target_len <= 1:
-        return xy_src[[0], :] if n >= 1 else np.zeros((1,2), dtype=float)
-    if n == 0:  return np.zeros((target_len,2), dtype=float)
-    if n == 1:  return np.repeat(xy_src, target_len, axis=0)
-    if n == target_len: return xy_src.copy()
-    xp_src = np.linspace(0.0, 1.0, num=n)
-    xp_tgt = np.linspace(0.0, 1.0, num=target_len)
-    x_new = np.interp(xp_tgt, xp_src, xy_src[:,0])
-    y_new = np.interp(xp_tgt, xp_src, xy_src[:,1])
-    return np.column_stack([x_new, y_new])
-
-def hungarian_np(cost):
-    n = cost.shape[0]
-    rows = list(range(n))
-    cols = set(range(n))
-    r_idx, c_idx = [], []
-    for i in rows:
-        cand_cols = list(cols)
-        j = cand_cols[int(np.argmin(cost[i, cand_cols]))]
-        r_idx.append(i); c_idx.append(j)
-        cols.remove(j)
-    return np.array(r_idx), np.array(c_idx)
+    return float(np.mean(dists)), float(np.median(dists))
 
 
 # -------------------------------
-# 核心算法
+# Geo-I 平面拉普拉斯噪声
+# r ~ Gamma(k=2, theta=1/epsilon), theta ~ U[0,2π)
 # -------------------------------
-def algo2_shuffle_fast(traj_df,
-                       win_minutes=TIME_WINDOW_MIN,
-                       cell_size=None,
-                       rs=RS, re=RE, dv=DV, dtheta=DTHETA,
-                       len_tol=LEN_TOL,
-                       max_hungarian_n=MAX_HUNGARIAN_N,
-                       identity_penalty=IDENTITY_PENALTY,
-                       max_swap_dist=MAX_SWAP_DIST_M):
+def planar_laplace_noise(epsilon: float, n: int):
+    if epsilon < 0:
+        raise ValueError("epsilon must be >= 0")
+    if epsilon == 0 or n == 0:
+        return np.zeros(n), np.zeros(n)
+    r = np.random.gamma(shape=2.0, scale=1.0/epsilon, size=n)
+    ang = np.random.uniform(0.0, 2.0*np.pi, size=n)
+    return r * np.cos(ang), r * np.sin(ang)
+
+
+# -------------------------------
+# 算法1：仅本地扰动（对照组/基线）
+# -------------------------------
+def algo1_local_pl_only(df: pd.DataFrame,
+                        epsilon: float,
+                        seed: int = 0,
+                        keep_bbox: bool = True):
     """
-    窗口级候选 + 三段兜底 + 无近邻允许自匹配 + 最大置换距离硬约束
-    返回:
-        out_df: [user_id, t, x, y]
-        metrics: {'BRP','ADE','FDE'}
+    对照组：只添加 PL_ε 噪声，不进行全局置换。
     """
-    rng = np.random.default_rng(RANDOM_SEED)
+    np.random.seed(seed)
+    out = df.copy()
 
-    # 1) 生成窗口内“轨迹段”（每用户每窗一个）
-    seg_list = []
-    for w, u, g in window_iter(traj_df, win_minutes=win_minutes):
-        xy = g[["x","y"]].to_numpy(dtype=np.float32)
-        tt = (g["t"].astype("int64") // 10**9).to_numpy()
-        if len(xy) < 2: continue
-        vbar, thetabar, length = segment_stats(xy, tt)
-        seg_list.append(dict(
-            w=w, u=u, xy=xy, t=tt,
-            stats=(vbar, thetabar, length),
-            start=xy[0], end=xy[-1]
-        ))
-    seg_df = pd.DataFrame(seg_list)
-    if seg_df.empty:
-        return traj_df.copy(), {"BRP":1.0, "ADE":0.0, "FDE":0.0}
+    # --- 本地扰动（在米制下）---
+    # 经纬 -> 米
+    x_m, y_m, meta = lonlat_to_m(out["lon"].to_numpy(float), out["lat"].to_numpy(float))
 
-    perm_assign = {}            # (w, gi) -> gj
-    brp_candidates = {}         # gi -> 候选(全局索引列表)
-    total_swaps, total_self = 0, 0
+    # 噪声
+    dx, dy = planar_laplace_noise(epsilon, len(out))
+    x2, y2 = x_m + dx, y_m + dy
 
-    # 2) 按窗口处理
-    for w, seg_w in seg_df.groupby("w", sort=False):
-        idxs = seg_w.index.to_numpy()
-        n = len(idxs)
-        if n < 2:
-            gi = idxs[0]
-            perm_assign[(w, gi)] = gi
-            brp_candidates[gi]   = [gi]
-            continue
+    # 可选边界裁剪
+    if keep_bbox:
+        xmin, xmax = x_m.min(), x_m.max()
+        ymin, ymax = y_m.min(), y_m.max()
+        pad_x = 0.01 * max(1.0, xmax - xmin)
+        pad_y = 0.01 * max(1.0, ymax - ymin)
+        x2 = np.clip(x2, xmin - pad_x, xmax + pad_x)
+        y2 = np.clip(y2, ymin - pad_y, ymax + pad_y)
 
-        starts = np.vstack(seg_df.loc[idxs, "start"].to_numpy())
-        ends   = np.vstack(seg_df.loc[idxs, "end"].to_numpy())
-        stats  = np.vstack(seg_df.loc[idxs, "stats"].to_numpy())  # [v, theta, len]
-        v_arr, th_arr, len_arr = stats[:,0], stats[:,1], stats[:,2]
+    # 米 -> 经纬
+    lon2, lat2 = m_to_lonlat(x2, y2, meta)
 
-        # KDTree
-        if SK_KDTREE:
-            tree_s = KDTree(starts)
-            tree_e = KDTree(ends) if (re is not None and re > 0) else None
-        else:
-            tree_s = tree_e = None
-            ds_all = np.sqrt(((starts[:,None,:]-starts[None,:,:])**2).sum(axis=2))
-            de_all = np.sqrt(((ends[:,None,:]-ends[None,:,:])**2).sum(axis=2)) if (re is not None and re > 0) else None
+    out["orig_lon"] = out["lon"].to_numpy(float)
+    out["orig_lat"] = out["lat"].to_numpy(float)
+    out["lon"] = lon2
+    out["lat"] = lat2
 
-        BIG = identity_penalty
-        use_hungarian = (n <= max_hungarian_n)
+    # 对照组没有 anon_id，但为了后续代码结构统一，可保留 user_id
+    out["anon_id"] = out["user_id"]
 
-        # ---------- 候选构造（带最大置换距离） ----------
-        def build_candidates(ii: int):
-            """
-            优先在 {rs,re} 半径内找候选；若无 -> 逐步扩半径；
-            再施加“最大置换距离”硬约束（起点与终点都 <= max_swap_dist）。
-            若仍无候选 -> 返回空，让外层允许自匹配。
-            """
-            muls = (1.0, 1.5, 2.0, 3.0)
-            RS_MAX = 8000.0
-            RE_MAX = 20000.0 if (re is not None and re > 0) else RS_MAX
+    # ... 在 algo1_local_pl_only 的 return 前 ...
 
-            for m in muls:
-                rad_s = min(rs * m, RS_MAX)
-                rad_e = min((re if (re is not None and re > 0) else rs) * m, RE_MAX)
+    # 将内部计算好的米制坐标附加到输出DataFrame中
+    out["orig_x_m"] = x_m
+    out["orig_y_m"] = y_m
+    out["pub_x_m"] = x2
+    out["pub_y_m"] = y2
 
-                if SK_KDTREE:
-                    idx_s = tree_s.query_radius(starts[[ii]], rad_s)[0]
-                    if tree_e is not None:
-                        idx_e = tree_e.query_radius(ends[[ii]], rad_e)[0]
-                    else:
-                        idx_e = np.arange(n)
-                else:
-                    idx_s = np.where(ds_all[ii] <= rad_s)[0]
-                    idx_e = np.where(de_all[ii] <= rad_e)[0] if de_all is not None else np.arange(n)
+    return out, None, meta
 
-                base = np.intersect1d(idx_s, idx_e)
-                base = base[base != ii]
-                if base.size == 0:
-                    base = idx_s[idx_s != ii]
-                if base.size == 0:
-                    continue  # 扩半径继续
 
-                # 最大置换距离硬约束（原始米）
-                ds_base = np.linalg.norm(starts[base] - starts[ii], axis=1)
-                mask = (ds_base <= max_swap_dist)
-                if re is not None and re > 0:
-                    de_base = np.linalg.norm(ends[base] - ends[ii], axis=1)
-                    mask &= (de_base <= max_swap_dist)
-                base = base[mask]
-                if base.size == 0:
-                    continue
+# -------------------------------
+# 算法2：全局置换 + 本地扰动
+# -------------------------------
+def algo2_global_shuffle_and_pl(df: pd.DataFrame,
+                                epsilon: float,
+                                seed: int = 0,
+                                keep_bbox: bool = True):
+    """
+    输入：原始经纬度数据（列：user_id,timestamp,lon,lat）
+    流程：
+      1) 全局一次性随机置换 user_id（整份数据映射一致）
+      2) 经纬度 -> 米制；添加 PL_ε 噪声；可选边界裁剪；再转回经纬度
+    返回：
+      out_df：列 [anon_id, timestamp, lon, lat, orig_lon, orig_lat, user_id, anon_map]
+    """
+    np.random.seed(seed)
 
-                # 运动学过滤；若过滤空，则退回 base
-                dvv = np.abs(v_arr[ii] - v_arr[base]) <= dv
-                dtt = angdiff_vec(th_arr[ii], th_arr[base]) <= dtheta
-                dll = np.abs(len_arr[ii] - len_arr[base]) <= len_tol
-                cand = base[dvv & dtt & dll]
-                return cand if cand.size else base
+    # --- 1) 全局置换 ---
+    users = df["user_id"].drop_duplicates().to_numpy()
+    perm  = users.copy()
+    np.random.shuffle(perm)  # 论文里默认随机置换；不强制去除固定点
+    mapping = {u_new: int(u_old) for u_new, u_old in zip(perm, users)}
+    # 注意：上式是“原用户 -> 匿名ID”的映射；我们令匿名ID为 1..N 的紧致序号更利于导出
+    # 为保持可重复且紧致，这里改为：原用户排序后，打乱为 [1..N]
+    users_sorted = np.sort(users)
+    anon_ids = np.arange(1, len(users_sorted)+1, dtype=int)
+    np.random.shuffle(anon_ids)
+    map_orig_to_anon = {int(u): int(a) for u, a in zip(users_sorted, anon_ids)}
 
-            # 无任何空间近邻 -> 交给外层允许自匹配
-            return np.array([], dtype=int)
+    out = df.copy()
+    out["anon_id"] = out["user_id"].map(map_orig_to_anon).astype(int)
 
-        # 归一化常数
-        RS_N = max(rs, 1.0)
-        RE_N = max(re if (re is not None and re > 0) else rs, 1.0)
-        DV_N = max(dv, 1.0)
-        DT_N = max(dtheta, 1.0)
-        LL_N = max(len_tol, 1.0)
+    # --- 2) 本地扰动（在米制下）---
+    # 经纬 -> 米
+    x_m, y_m, meta = lonlat_to_m(out["lon"].to_numpy(float), out["lat"].to_numpy(float))
 
-        if use_hungarian:
-            cost = np.full((n, n), BIG, dtype=np.float64)
-            for ii in range(n):
-                cand = build_candidates(ii)
-                if cand.size == 0:
-                    # 无近邻 -> 允许自匹配（对角为0）
-                    cost[ii, ii] = 0.0
-                    brp_candidates[idxs[ii]] = [idxs[ii]]
-                    continue
+    # 噪声
+    dx, dy = planar_laplace_noise(epsilon, len(out))
+    x2, y2 = x_m + dx, y_m + dy
 
-                # 有候选 -> 禁止自匹配
-                cost[ii, ii] = BIG
+    # 可选边界裁剪（避免落在极远处；按原数据范围 ±1% 外扩）
+    if keep_bbox:
+        xmin, xmax = x_m.min(), x_m.max()
+        ymin, ymax = y_m.min(), y_m.max()
+        pad_x = 0.01 * max(1.0, xmax - xmin)
+        pad_y = 0.01 * max(1.0, ymax - ymin)
+        x2 = np.clip(x2, xmin - pad_x, xmax + pad_x)
+        y2 = np.clip(y2, ymin - pad_y, ymax + pad_y)
 
-                # 空间项（归一化）+ 运动学项
-                ds = np.linalg.norm(starts[ii] - starts[cand], axis=1) / RS_N
-                de = np.linalg.norm(ends[ii]   - ends[cand],   axis=1) / RE_N
-                dvv = np.abs(v_arr[ii]  - v_arr[cand]) / DV_N
-                dtt = angdiff_vec(th_arr[ii], th_arr[cand]) / DT_N
-                dll = np.abs(len_arr[ii]- len_arr[cand])   / LL_N
+    # 米 -> 经纬
+    lon2, lat2 = m_to_lonlat(x2, y2, meta)
 
-                c = W_S*ds + W_E*de + W_V*dvv + W_T*dtt + W_L*dll
-                cost[ii, cand] = 1e-6 + c
-                brp_candidates[idxs[ii]] = [idxs[j] for j in cand]
+    out["orig_lon"] = out["lon"].to_numpy(float)
+    out["orig_lat"] = out["lat"].to_numpy(float)
+    out["lon"] = lon2
+    out["lat"] = lat2
 
-            if SCIPY_OK:
-                r_idx, c_idx = linear_sum_assignment(cost)
-            else:
-                r_idx, c_idx = hungarian_np(cost)
+    # 可记录映射表（导出或审计）
+    map_df = pd.DataFrame({"user_id": users_sorted, "anon_id": anon_ids}).sort_values("anon_id")
 
-            for r, c in zip(r_idx, c_idx):
-                gi = idxs[r]; gj = idxs[c]
+    # ... 在 algo2_global_shuffle_and_pl 的 return 前 ...
 
-                # 复核原始距离，超阈值则自匹配
-                ds_raw = float(np.linalg.norm(starts[r] - starts[c]))
-                if re is not None and re > 0:
-                    de_raw = float(np.linalg.norm(ends[r] - ends[c]))
-                    too_far = (ds_raw > max_swap_dist) or (de_raw > max_swap_dist)
-                else:
-                    too_far = (ds_raw > max_swap_dist)
+    # 将内部计算好的米制坐标附加到输出DataFrame中
+    out["orig_x_m"] = x_m
+    out["orig_y_m"] = y_m
+    out["pub_x_m"] = x2
+    out["pub_y_m"] = y2
 
-                if too_far:
-                    gj = gi
-                    total_self += 1
-                else:
-                    if gj != gi: total_swaps += 1
-                    else:        total_self  += 1
+    return out, map_df, meta
 
-                perm_assign[(w, gi)] = gj
+# -------------------------------
+# 指标：location-privacy 与 utility
+# -------------------------------
+def haversine_m(lon1, lat1, lon2, lat2):
+    R = 6371000.0
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
+    c = 2*np.arcsin(np.sqrt(a))
+    return R * c
 
-        else:
-            # 贪心
-            assigned = set()
-            cand_map = {}
-            for ii in range(n):
-                cand = build_candidates(ii)
-                cand_map[ii] = cand
-                brp_candidates[idxs[ii]] = [idxs[j] for j in cand] if cand.size else [idxs[ii]]
+def compute_metrics(out_df: pd.DataFrame, epsilon: float, window: str = "5min"):
+    # AOD/ADE: 所有点的位移距离（米）平均
+    disp = haversine_m(out_df["orig_lon"], out_df["orig_lat"], out_df["lon"], out_df["lat"])
+    aod = float(disp.mean())
+    med_disp = float(disp.median())
 
-            order = sorted(range(n), key=lambda i: len(cand_map[i]) if len(cand_map[i])>0 else 9e9)
-            for ii in order:
-                gi = idxs[ii]
-                cand = [j for j in cand_map[ii] if j not in assigned]
-                if not cand:
-                    gj = gi
-                else:
-                    cand = np.array(cand, dtype=int)
-                    ds = np.linalg.norm(starts[ii] - starts[cand], axis=1) / RS_N
-                    de = np.linalg.norm(ends[ii]   - ends[cand],   axis=1) / RE_N
-                    dvv = np.abs(v_arr[ii]  - v_arr[cand]) / DV_N
-                    dtt = angdiff_vec(th_arr[ii], th_arr[cand]) / DT_N
-                    dll = np.abs(len_arr[ii]- len_arr[cand])   / LL_N
-                    cc  = W_S*ds + W_E*de + W_V*dvv + W_T*dtt + W_L*dll
-                    jj  = cand[int(np.argmin(cc))]
+    # FDE: 每个用户的“末点位移”的平均
+    last = out_df.sort_values("timestamp").groupby("anon_id").tail(1)
+    fde = float(haversine_m(last["orig_lon"], last["orig_lat"], last["lon"], last["lat"]).mean())
 
-                    # 复核硬距离
-                    ds_raw = float(np.linalg.norm(starts[ii] - starts[jj]))
-                    if re is not None and re > 0:
-                        de_raw = float(np.linalg.norm(ends[ii] - ends[jj]))
-                        too_far = (ds_raw > max_swap_dist) or (de_raw > max_swap_dist)
-                    else:
-                        too_far = (ds_raw > max_swap_dist)
+    # k/BRP（用于横向参照）：按时间窗口统计并发用户数
+    tmp = out_df.copy()
+    tmp["bin"] = pd.to_datetime(tmp["timestamp"]).dt.floor(window)
+    k_by_bin = tmp.groupby("bin")["anon_id"].nunique()
+    k_mean = float(k_by_bin.mean()) if len(k_by_bin) else 0.0
+    brp = float((1.0 / k_by_bin).mean()) if len(k_by_bin) else 0.0
 
-                    if too_far:
-                        gj = gi
-                    else:
-                        assigned.add(jj)
-                        gj = idxs[jj]
+    # 额外给出理论期望：E[r]=2/epsilon（平面拉普拉斯半径期望，作参考）
+    theo_E_r = float(2.0/epsilon) if epsilon > 0 else float("inf")
 
-                perm_assign[(w, gi)] = gj
-                if gj != gi: total_swaps += 1
-                else:        total_self  += 1
-
-        # 每窗诊断
-        cand_sizes = [len(brp_candidates[idxs[i]]) for i in range(n)]
-        has_cand   = np.mean(np.array(cand_sizes) > 0)
-        multi_cand = np.mean(np.array(cand_sizes) > 1)
-        print(f"[窗口 {w}] n={n}, 有候选率={has_cand:.1%}, 候选>1率={multi_cand:.1%}")
-
-    # 3) 应用置换
-    seg_map = {gi: perm_assign.get((seg_df.at[gi,"w"], gi), gi) for gi in seg_df.index}
-    out_rows = []
-    for gi, row in seg_df.iterrows():
-        gj = seg_map.get(gi, gi)
-        xy_new = seg_df.at[gj, "xy"]
-        xy_old = row["xy"]
-        if xy_new.shape[0] < 2:
-            xy_new = np.vstack([xy_new, xy_new])
-        xy_new_interp = resample_to_len(xy_new, len(xy_old))
-        for (xv, yv), tv in zip(xy_new_interp, row["t"]):
-            out_rows.append((row["w"], row["u"], pd.to_datetime(tv, unit="s"), xv, yv))
-    out_df = pd.DataFrame(out_rows, columns=["w","user_id","t","x","y"]).sort_values(["user_id","t"]).reset_index(drop=True)
-
-    # 4) 指标：BRP / ADE / FDE
-    def grid_key(pt, g=None):
-        g0 = PRIOR_GRID_M if (PRIOR_GRID_M and PRIOR_GRID_M > 0) else (cell_size if cell_size else CELL_SIZE_M)
-        return (int(math.floor(pt[0] / g0)), int(math.floor(pt[1] / g0)))
-
-    starts_orig = [tuple(s) for s in np.vstack(seg_df["start"].to_numpy())]
-    prior_counts = Counter([grid_key(s) for s in starts_orig])
-    total_segs = len(starts_orig)
-    prior_prob  = {k: v/total_segs for k, v in prior_counts.items()}
-
-    BRP_list, ADE_list, FDE_list = [], [], []
-    for gi, row in seg_df.iterrows():
-        C = brp_candidates.get(gi, [gi])
-        denom = sum(prior_prob.get(grid_key(seg_df.at[c, "start"]), 1e-9) for c in C)
-        num   = prior_prob.get(grid_key(row["start"]), 1e-9)
-        BRP_list.append(0.0 if denom == 0 else num/denom)
-
-        gj = seg_map.get(gi, gi)
-        xy_old = row["xy"]
-        xy_new = resample_to_len(seg_df.at[gj,"xy"], len(xy_old))
-        diff   = xy_old - xy_new
-        ade = float(np.mean(np.sqrt(np.sum(diff**2, axis=1))))
-        fde = float(np.linalg.norm(xy_old[-1] - xy_new[-1]))
-        ADE_list.append(ade); FDE_list.append(fde)
-
-    metrics = {"BRP": float(np.mean(BRP_list)),
-               "ADE": float(np.mean(ADE_list)),
-               "FDE": float(np.mean(FDE_list))}
-
-    # 5) 统计
-    all_pairs = len(seg_df)
-    print("=== 置换统计 ===")
-    print(f"总置换数: {total_swaps}")
-    print(f"自匹配数: {total_self}")
-    print(f"置换率: {total_swaps/max(1,all_pairs):.1%}")
-
-    return out_df[["user_id","t","x","y"]], metrics
-
+    return {
+        "epsilon": float(epsilon),
+        "AOD_m": aod,              # 同点级 ADE
+        "median_disp_m": med_disp,
+        "FDE_m": fde,
+        "k_anonymity_mean": k_mean,
+        "BRP": brp,
+        "theory_E_r_m": theo_E_r
+    }
 
 # -------------------------------
 # CLI
 # -------------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="tdrive_data", help="数据文件夹(含若干txt/csv)")
-    parser.add_argument("--out", type=str, default="algo2_fast_output.csv", help="输出CSV文件名")
-    parser.add_argument("--limit_files", type=int, default=LIMIT_FILES, help="最多读取多少个文件")
-    parser.add_argument("--limit_rows",  type=int, default=LIMIT_ROWS,  help="最多读取多少行")
-    parser.add_argument("--cell_size",   type=float, default=CELL_SIZE_M, help="备用网格大小(米)")
-    parser.add_argument("--max_swap_dist", type=float, default=MAX_SWAP_DIST_M, help="最大置换距离(米)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Algorithm 2 (global shuffle + Geo-I PL noise)")
+    ap.add_argument("--data_dir", type=str, default="tdrive_data", help="数据目录（含若干 .txt/.csv）")
+    ap.add_argument("--out_csv", type=str, default=None, help="输出文件（默认写入 data_dir/algo2_output.csv）")
+    ap.add_argument("--map_csv", type=str, default=None, help="可选：输出 user->anon 映射表")
+    ap.add_argument("--metrics_csv", type=str, default=None, help="可选：输出指标到CSV")
+    ap.add_argument("--epsilon", type=float, required=True, help="Geo-I 平面拉普拉斯噪声参数 ε (>=0)")
+    ap.add_argument("--seed", type=int, default=0, help="随机种子（全局置换与噪声）")
+    ap.add_argument("--window", type=str, default="5min", help="用于 k/BRP 统计的时间窗口")
+    ap.add_argument("--no_bbox", action="store_true", help="不做边界裁剪")
+    args = ap.parse_args()
 
-    df_xy = load_folder_tdrive(args.data_dir, args.limit_files, args.limit_rows)
-    print_diagnostics(df_xy)
-    print(f"Loaded rows={len(df_xy)} users={df_xy['user_id'].nunique()}")
+    df = load_tdrive_folder(args.data_dir)
+    #df = df.head(100).copy()
+    print("=== 数据诊断 ===")
+    print(f"总行数: {len(df)}")
+    print(f"用户数: {df['user_id'].nunique()}")
+    print(f"时间范围: {df['timestamp'].min()} 到 {df['timestamp'].max()}")
 
-    out_df, metrics = algo2_shuffle_fast(
-        df_xy,
-        win_minutes=TIME_WINDOW_MIN,
-        cell_size=args.cell_size,
-        rs=RS, re=RE, dv=DV, dtheta=DTHETA,
-        len_tol=LEN_TOL,
-        max_hungarian_n=MAX_HUNGARIAN_N,
-        identity_penalty=IDENTITY_PENALTY,
-        max_swap_dist=args.max_swap_dist
+    out_df, map_df, meta = algo2_global_shuffle_and_pl(
+        df, epsilon=args.epsilon, seed=args.seed, keep_bbox=(not args.no_bbox)
     )
 
-    print("=== 指标 ===")
-    print(metrics)
-    out_path = os.path.join(args.data_dir, args.out) if os.path.isdir(args.data_dir) else args.out
-    out_df.to_csv(out_path, index=False)
-    print(f"输出: {out_path}")
+    # # 评估指标
+    # metrics = compute_metrics(out_df, epsilon=args.epsilon, window=args.window)
+    # print("=== 指标（Algorithm 2）===")
+    # for k, v in metrics.items():
+    #     print(f"{k}: {v}")
+    #
+    # # ====== LP 评估（贝叶斯最优重映射） ======
+    # # 网格大小建议与目标 SQL 同量级/2；若你已算出 theory_E_r_m，可取 cell≈max(50m, theory_E_r_m/2)
+    # theory_E_r_m = metrics["theory_E_r_m"]
+    # cell_m = max(50.0, theory_E_r_m / 2.0)
+    # prior, meta = build_prior_grid(df_true_xy["x_m"], df_true_xy["y_m"], cell_m=cell_m, smooth=1.0)
+    #
+    # # 搜索半径取 4~5 倍理论噪声，保证覆盖足够候选
+    # radius_m = max(500.0, 5.0 * theory_E_r_m)
+    #
+    # lp_mean_m, lp_median_m = compute_LP_mean_median(
+    #     df_true_xy, df_pub_xy, epsilon, prior, meta, radius_m,
+    #     rid_col=("rid" if "rid" in df_true_xy.columns and "rid" in df_pub_xy.columns else None)
+    # )
+    #
+    # metrics["LP_mean_m"] = lp_mean_m
+    # metrics["LP_median_m"] = lp_median_m
+    # print(f"LP_mean_m: {lp_mean_m:.3f}")
+    # print(f"LP_median_m: {lp_median_m:.3f}")
+    # ... main() 函数的前半部分保持不变 ...
+
+    # ======================================================
+    # 1. 评估您的主算法 (Algo 2: Shuffle + PL)
+    # ======================================================
+    # --- LP 评估 ---
+    # 直接使用算法函数返回的、更可靠的米制坐标
+    df_true_xy = out_df[["orig_x_m", "orig_y_m"]].rename(columns={"orig_x_m": "x_m", "orig_y_m": "y_m"})
+    df_pub_xy = out_df[["pub_x_m", "pub_y_m"]].rename(columns={"pub_x_m": "x_m", "pub_y_m": "y_m"})
+
+    theory_E_r_m = metrics["theory_E_r_m"]
+    cell_m = max(50.0, theory_E_r_m / 2.0)
+    # 使用修改后的 df_true_xy 来构建先验
+    prior, prior_meta = build_prior_grid(df_true_xy["x_m"], df_true_xy["y_m"], cell_m=cell_m, smooth=1.0)
+    radius_m = max(500.0, 5.0 * theory_E_r_m)
+
+    lp_mean_m, lp_median_m = compute_LP_mean_median(
+        df_true_xy, df_pub_xy, args.epsilon, prior, prior_meta, radius_m
+    )
+    metrics["LP_mean_m"] = lp_mean_m
+    metrics["LP_median_m"] = lp_median_m
+    print("--- 攻击者指标 ---")
+    print(f"LP_mean_m: {lp_mean_m:.3f}")
+    print(f"LP_median_m: {lp_median_m:.3f}")
+
+    # ======================================================
+    # 2. 评估对照组算法 (Algo 1: PL only)
+    # ======================================================
+    print("\n\n=== 评估对照组 (Algo 1: PL Only) ===")
+    baseline_out_df, _, _ = algo1_local_pl_only(
+        df, epsilon=args.epsilon, seed=args.seed, keep_bbox=(not args.no_bbox)
+    )
+
+    # 评估指标
+    baseline_metrics = compute_metrics(baseline_out_df, epsilon=args.epsilon, window=args.window)
+    print("--- 基础指标 ---")
+    for k, v in baseline_metrics.items():
+        print(f"{k}: {v}")
+
+    # --- LP 评估 (使用相同的 prior) ---
+    # 准备发布坐标（米制），真实坐标不变
+    # --- LP 评估 (使用相同的 prior) ---
+    # 直接使用算法函数返回的、更可靠的米制坐标
+    baseline_true_xy = baseline_out_df[["orig_x_m", "orig_y_m"]].rename(columns={"orig_x_m": "x_m", "orig_y_m": "y_m"})
+    baseline_pub_xy = baseline_out_df[["pub_x_m", "pub_y_m"]].rename(columns={"pub_x_m": "x_m", "pub_y_m": "y_m"})
+
+    baseline_lp_mean_m, baseline_lp_median_m = compute_LP_mean_median(
+        baseline_true_xy, baseline_pub_xy, args.epsilon, prior, prior_meta, radius_m
+    )
+    baseline_metrics["LP_mean_m"] = baseline_lp_mean_m
+    baseline_metrics["LP_median_m"] = baseline_lp_median_m
+    print("--- 攻击者指标 ---")
+    print(f"LP_mean_m: {baseline_lp_mean_m:.3f}")
+    print(f"LP_median_m: {baseline_lp_median_m:.3f}")
+
+    # (可选) 导出结果...
+    # ...
+
+    # # 导出
+    # out_path = args.out_csv or os.path.join(args.data_dir, "algo2_output.csv")
+    # out_df[["anon_id","timestamp","lon","lat","orig_lon","orig_lat"]].to_csv(out_path, index=False)
+    # print(f"输出: {out_path}")
+    #
+    # if args.map_csv:
+    #     map_df.to_csv(args.map_csv, index=False)
+    #     print(f"映射表: {args.map_csv}")
+    # if args.metrics_csv:
+    #     pd.DataFrame([metrics]).to_csv(args.metrics_csv, index=False)
+    #     print(f"指标已保存: {args.metrics_csv}")
 
 if __name__ == "__main__":
     main()
